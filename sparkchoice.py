@@ -5,17 +5,19 @@ and expresses it as a concrete artifact-producing action.
 The loop:
   1. Takes a goal + current state (what exists so far)
   2. Generates candidate next-actions (each produces a tangible artifact)
-  3. Scores each on: dependency (does it unblock others?), risk (does it
-     reduce uncertainty?), readiness (can we do it right now?), impact
-  4. Emits the most prudent choice — not the flashiest, the one that
-     makes everything else easier or possible
+  3. Scores each on: unblocks, reduces_risk, readiness, impact
+  4. Selects a scoring strategy appropriate to the situation
+  5. Ranks candidates using the chosen strategy
+  6. Emits the most prudent choice
 """
 
 from __future__ import annotations
 import json
 import os
 import sys
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
+from functools import reduce
 
 import anthropic
 
@@ -24,7 +26,7 @@ import anthropic
 
 @dataclass
 class Scores:
-    """Why this action was chosen over alternatives."""
+    """Raw dimension scores for a candidate action."""
     unblocks: int      # 1-5: how many downstream actions does this enable?
     reduces_risk: int  # 1-5: does this retire uncertainty or validate assumptions?
     readiness: int     # 1-5: do we have everything needed to do this now?
@@ -32,13 +34,17 @@ class Scores:
 
     @property
     def prudence(self) -> float:
-        """Weighted score favoring actions that are ready and unblocking."""
+        """Legacy weighted score. Use a Strategy for smarter ranking."""
         return (
             self.unblocks * 3
             + self.reduces_risk * 2
             + self.readiness * 2
             + self.impact * 1
         )
+
+    def as_tuple(self) -> tuple[int, int, int, int]:
+        """Return dimensions as (unblocks, reduces_risk, readiness, impact)."""
+        return (self.unblocks, self.reduces_risk, self.readiness, self.impact)
 
 
 @dataclass
@@ -65,13 +71,161 @@ class Action:
         return "\n".join(parts)
 
 
+# ── Strategies ──────────────────────────────────────────────────────────
+
+class Strategy(ABC):
+    """Base class for candidate ranking strategies."""
+    name: str = ""
+    description: str = ""
+
+    @abstractmethod
+    def rank(self, candidates: list[Action]) -> list[Action]:
+        """Return candidates sorted best-first."""
+        ...
+
+    def __repr__(self):
+        return f"<Strategy: {self.name}>"
+
+
+class WeightedSum(Strategy):
+    """Original linear weighted sum. Fast, simple, good default."""
+    name = "weighted_sum"
+    description = (
+        "Linear weighted sum (unblocks×3, risk×2, readiness×2, impact×1). "
+        "Best when candidates are clearly differentiated."
+    )
+
+    def __init__(self, weights: tuple[int, ...] = (3, 2, 2, 1)):
+        self.weights = weights
+
+    def rank(self, candidates: list[Action]) -> list[Action]:
+        def score(a: Action) -> float:
+            return sum(d * w for d, w in zip(a.scores.as_tuple(), self.weights))
+        return sorted(candidates, key=score, reverse=True)
+
+
+class GeometricMean(Strategy):
+    """Geometric mean punishes any weak dimension severely."""
+    name = "geometric_mean"
+    description = (
+        "Geometric mean across all dimensions. Rewards balance, "
+        "punishes any weakness. Best when you can't afford a blind spot."
+    )
+
+    def rank(self, candidates: list[Action]) -> list[Action]:
+        def score(a: Action) -> float:
+            dims = a.scores.as_tuple()
+            product = reduce(lambda x, y: x * y, dims)
+            return product ** (1.0 / len(dims))
+        return sorted(candidates, key=score, reverse=True)
+
+
+class EliminationGates(Strategy):
+    """Filter out candidates below thresholds, then rank survivors."""
+    name = "elimination_gates"
+    description = (
+        "Eliminates candidates below minimum thresholds, then ranks "
+        "survivors by weighted sum. Best when some options are clearly not viable."
+    )
+
+    def __init__(self, min_readiness: int = 3, min_any: int = 2):
+        self.min_readiness = min_readiness
+        self.min_any = min_any
+
+    def rank(self, candidates: list[Action]) -> list[Action]:
+        survivors = [
+            c for c in candidates
+            if c.scores.readiness >= self.min_readiness
+            and all(d >= self.min_any for d in c.scores.as_tuple())
+        ]
+        # If gates kill everything, fall back to all candidates
+        if not survivors:
+            survivors = candidates
+        return WeightedSum().rank(survivors)
+
+
+class ParetoThenWeighted(Strategy):
+    """Keep only non-dominated candidates, then rank among those."""
+    name = "pareto"
+    description = (
+        "Pareto ranking: keeps only non-dominated candidates, then breaks "
+        "ties with weighted sum. Best when several candidates are competitive."
+    )
+
+    def rank(self, candidates: list[Action]) -> list[Action]:
+        def dominates(a: Action, b: Action) -> bool:
+            a_dims = a.scores.as_tuple()
+            b_dims = b.scores.as_tuple()
+            at_least = all(ai >= bi for ai, bi in zip(a_dims, b_dims))
+            strict = any(ai > bi for ai, bi in zip(a_dims, b_dims))
+            return at_least and strict
+
+        non_dominated = [
+            c for c in candidates
+            if not any(
+                dominates(other, c)
+                for other in candidates if other is not c
+            )
+        ]
+        if not non_dominated:
+            non_dominated = candidates
+        return WeightedSum().rank(non_dominated)
+
+
+class PhaseAdaptive(Strategy):
+    """Shifts weights based on project phase."""
+    name = "phase_adaptive"
+    description = (
+        "Adjusts scoring weights based on project phase. "
+        "Best when the goal clearly implies greenfield, building, "
+        "polishing, or firefighting."
+    )
+
+    PHASE_WEIGHTS: dict[str, tuple[int, ...]] = {
+        "greenfield":   (2, 3, 2, 1),  # risk reduction dominates
+        "building":     (3, 2, 2, 1),  # unblocking matters most
+        "polishing":    (1, 2, 2, 3),  # impact rises
+        "firefighting": (1, 3, 3, 1),  # risk + readiness, move NOW
+    }
+
+    def __init__(self, phase: str = "building"):
+        if phase not in self.PHASE_WEIGHTS:
+            phase = "building"
+        self.phase = phase
+        self.weights = self.PHASE_WEIGHTS[phase]
+
+    def rank(self, candidates: list[Action]) -> list[Action]:
+        return WeightedSum(weights=self.weights).rank(candidates)
+
+
+# ── Strategy Registry ───────────────────────────────────────────────────
+
+STRATEGIES: dict[str, type[Strategy]] = {
+    "weighted_sum": WeightedSum,
+    "geometric_mean": GeometricMean,
+    "elimination_gates": EliminationGates,
+    "pareto": ParetoThenWeighted,
+    "phase_adaptive": PhaseAdaptive,
+}
+
+
+def get_strategy(name: str, **kwargs) -> Strategy:
+    """Instantiate a strategy by name."""
+    cls = STRATEGIES.get(name)
+    if cls is None:
+        raise ValueError(
+            f"Unknown strategy: {name}. "
+            f"Available: {list(STRATEGIES.keys())}"
+        )
+    return cls(**kwargs)
+
+
 # ── Core ────────────────────────────────────────────────────────────────
 
 SYSTEM = """\
 You are SparkChoice, a planning engine. Given a goal and current state,
-you propose 3-5 candidate actions an AI could take next, then pick the
-most PRUDENT one — not the most ambitious, the one that is the wisest
-next step given the current situation.
+you propose 3-5 candidate actions an AI could take next, then recommend
+both a scoring strategy and a winner.
 
 Each action MUST produce a concrete artifact (file, document, dataset,
 code module, analysis, etc.) — no vague "think about" or "explore" steps.
@@ -83,9 +237,17 @@ Score each candidate on four dimensions (1-5):
 - readiness: Do we have everything needed to execute this right now?
 - impact: How much does this move the overall goal forward?
 
-The prudent choice is typically the one that is ready NOW, unblocks the
-most future work, and reduces the biggest current risk — even if another
-candidate has higher raw impact.
+Then select the most appropriate scoring strategy:
+- "weighted_sum": Linear weighted sum. Good default for clear-cut decisions.
+- "geometric_mean": Geometric mean. Use when balance matters and no
+  dimension should be weak.
+- "elimination_gates": Filter out unready or weak candidates first.
+  Use when some options are clearly not viable yet.
+- "pareto": Keep only non-dominated candidates, then pick. Use when
+  several candidates are competitive and you need nuance.
+- "phase_adaptive": Shift weights based on project phase. Use when
+  the goal/state clearly implies greenfield, building, polishing,
+  or firefighting. Include a "phase" field if you choose this.
 
 Respond with a JSON object:
 {
@@ -97,15 +259,24 @@ Respond with a JSON object:
       "inputs": ["..."], "outputs": ["..."]
     }
   ],
-  "chosen": 0,
-  "reasoning": "one sentence on why this candidate wins"
+  "strategy": "strategy_name",
+  "phase": "optional — only if strategy is phase_adaptive",
+  "reasoning": "why this strategy and this winner fit the situation"
 }
-"chosen" is the zero-based index of the best candidate.
+No "chosen" field — the strategy determines the winner.
 No markdown fences. No commentary outside the JSON."""
 
 
-def choose(goal: str, state: str = "", model: str = "claude-sonnet-4-6") -> tuple[Action, list[Action], str]:
-    """Return (chosen_action, all_candidates, reasoning)."""
+def choose(
+    goal: str,
+    state: str = "",
+    model: str = "claude-sonnet-4-6",
+    strategy: str | None = None,
+) -> tuple[Action, list[Action], str, Strategy]:
+    """Return (chosen_action, all_candidates, reasoning, strategy_used).
+
+    If `strategy` is provided, it overrides Claude's recommendation.
+    """
     api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
     client = anthropic.Anthropic(api_key=api_key)
 
@@ -127,23 +298,48 @@ def choose(goal: str, state: str = "", model: str = "claude-sonnet-4-6") -> tupl
         return Action(scores=Scores(**s), **d)
 
     candidates = [_to_action(c) for c in payload["candidates"]]
-    chosen = candidates[payload["chosen"]]
-    return chosen, candidates, payload["reasoning"]
+
+    # Strategy selection: explicit override > Claude's recommendation
+    strategy_name = strategy or payload.get("strategy", "weighted_sum")
+    strategy_kwargs: dict = {}
+    if strategy_name == "phase_adaptive" and "phase" in payload:
+        strategy_kwargs["phase"] = payload["phase"]
+
+    strat = get_strategy(strategy_name, **strategy_kwargs)
+    ranked = strat.rank(candidates)
+    chosen = ranked[0]
+
+    reasoning = payload.get("reasoning", "")
+    return chosen, candidates, reasoning, strat
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python sparkchoice.py '<goal>' ['<current state>']")
+        print("Usage: python sparkchoice.py '<goal>' ['<current state>'] [--strategy NAME]")
         sys.exit(1)
 
-    goal = sys.argv[1]
-    state = sys.argv[2] if len(sys.argv) > 2 else ""
-    chosen, candidates, reasoning = choose(goal, state)
+    # Parse args
+    args = sys.argv[1:]
+    strategy_override = None
+    if "--strategy" in args:
+        idx = args.index("--strategy")
+        if idx + 1 < len(args):
+            strategy_override = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
 
+    goal = args[0]
+    state = args[1] if len(args) > 1 else ""
+    chosen, candidates, reasoning, strat = choose(
+        goal, state, strategy=strategy_override
+    )
+
+    print(f"=== Strategy: {strat.name} ===")
+    print(f"    {strat.description}\n")
     print("=== Candidates ===\n")
-    for i, c in enumerate(candidates):
+    ranked = strat.rank(candidates)
+    for i, c in enumerate(ranked):
         marker = " ← CHOSEN" if c is chosen else ""
         print(f"  [{i}] {c.verb} → {c.artifact}{marker}")
         print(f"      unblocks={c.scores.unblocks} risk={c.scores.reduces_risk} "
