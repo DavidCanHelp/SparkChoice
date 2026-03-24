@@ -12,6 +12,7 @@ The loop:
 """
 
 from __future__ import annotations
+import datetime
 import json
 import os
 import sys
@@ -339,27 +340,68 @@ def choose(
     return chosen, ranked, reasoning, strat
 
 
+# ── Decision Logging ───────────────────────────────────────────────────
+
+def append_decision_log(
+    path: str,
+    goal: str,
+    state: str,
+    model: str,
+    strategy: Strategy,
+    reasoning: str,
+    chosen: Action,
+    candidates: list[Action],
+) -> None:
+    """Append a single JSONL entry to the decision log file."""
+    entry = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "goal": goal,
+        "state": state,
+        "model": model,
+        "strategy": strategy.name,
+        "reasoning": reasoning,
+        "chosen": asdict(chosen),
+        "candidates": [asdict(c) for c in candidates],
+    }
+    with open(path, "a") as f:
+        f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python sparkchoice.py '<goal>' ['<current state>'] [--strategy NAME]")
+        print("Usage: python sparkchoice.py '<goal>' ['<current state>'] [--strategy NAME] [--log FILE]")
         sys.exit(1)
 
     # Parse args
     args = sys.argv[1:]
     strategy_override = None
+    log_path = None
+
     if "--strategy" in args:
         idx = args.index("--strategy")
         if idx + 1 < len(args):
             strategy_override = args[idx + 1]
             args = args[:idx] + args[idx + 2:]
 
+    if "--log" in args:
+        idx = args.index("--log")
+        if idx + 1 < len(args):
+            log_path = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+
     goal = args[0]
     state = args[1] if len(args) > 1 else ""
+    model = "claude-sonnet-4-6"
     chosen, ranked, reasoning, strat = choose(
-        goal, state, strategy=strategy_override
+        goal, state, model=model, strategy=strategy_override
     )
+
+    if log_path:
+        append_decision_log(
+            log_path, goal, state, model, strat, reasoning, chosen, ranked,
+        )
 
     print(f"=== Strategy: {strat.name} ===")
     print(f"    {strat.description}\n")
