@@ -311,7 +311,7 @@ def choose(
 
     resp = client.messages.create(
         model=model,
-        max_tokens=1024,
+        max_tokens=4096,
         system=SYSTEM,
         messages=[{"role": "user", "content": user_msg}],
     )
