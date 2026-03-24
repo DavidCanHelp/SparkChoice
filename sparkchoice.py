@@ -121,16 +121,23 @@ class GeometricMean(Strategy):
 
 
 class EliminationGates(Strategy):
-    """Filter out candidates below thresholds, then rank survivors."""
+    """Filter out candidates below thresholds, then delegate ranking."""
     name = "elimination_gates"
     description = (
         "Eliminates candidates below minimum thresholds, then ranks "
-        "survivors by weighted sum. Best when some options are clearly not viable."
+        "survivors with a delegate strategy. Best when some options "
+        "are clearly not viable."
     )
 
-    def __init__(self, min_readiness: int = 3, min_any: int = 2):
+    def __init__(
+        self,
+        min_readiness: int = 3,
+        min_any: int = 2,
+        then: Strategy | None = None,
+    ):
         self.min_readiness = min_readiness
         self.min_any = min_any
+        self._then = then or WeightedSum()
 
     def rank(self, candidates: list[Action]) -> list[Action]:
         survivors = [
@@ -141,16 +148,20 @@ class EliminationGates(Strategy):
         # If gates kill everything, fall back to all candidates
         if not survivors:
             survivors = candidates
-        return WeightedSum().rank(survivors)
+        return self._then.rank(survivors)
 
 
-class ParetoThenWeighted(Strategy):
-    """Keep only non-dominated candidates, then rank among those."""
+class ParetoThenRank(Strategy):
+    """Keep only non-dominated candidates, then delegate ranking."""
     name = "pareto"
     description = (
         "Pareto ranking: keeps only non-dominated candidates, then breaks "
-        "ties with weighted sum. Best when several candidates are competitive."
+        "ties with a delegate strategy. Best when several candidates "
+        "are competitive."
     )
+
+    def __init__(self, then: Strategy | None = None):
+        self._then = then or WeightedSum()
 
     def rank(self, candidates: list[Action]) -> list[Action]:
         def dominates(a: Action, b: Action) -> bool:
@@ -169,7 +180,11 @@ class ParetoThenWeighted(Strategy):
         ]
         if not non_dominated:
             non_dominated = candidates
-        return WeightedSum().rank(non_dominated)
+        return self._then.rank(non_dominated)
+
+
+# Keep old name as alias for backward compatibility
+ParetoThenWeighted = ParetoThenRank
 
 
 class PhaseAdaptive(Strategy):
@@ -204,7 +219,7 @@ STRATEGIES: dict[str, type[Strategy]] = {
     "weighted_sum": WeightedSum,
     "geometric_mean": GeometricMean,
     "elimination_gates": EliminationGates,
-    "pareto": ParetoThenWeighted,
+    "pareto": ParetoThenRank,
     "phase_adaptive": PhaseAdaptive,
 }
 
@@ -282,9 +297,10 @@ def choose(
     model: str = "claude-sonnet-4-6",
     strategy: str | None = None,
 ) -> tuple[Action, list[Action], str, Strategy]:
-    """Return (chosen_action, all_candidates, reasoning, strategy_used).
+    """Return (chosen_action, ranked_candidates, reasoning, strategy_used).
 
     If `strategy` is provided, it overrides Claude's recommendation.
+    Candidates are returned in ranked order (best first).
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
     client = anthropic.Anthropic(api_key=api_key)
@@ -303,6 +319,7 @@ def choose(
     payload = json.loads(resp.content[0].text)
 
     def _to_action(d: dict) -> Action:
+        d = dict(d)  # shallow copy to avoid mutating payload
         s = d.pop("scores")
         return Action(scores=Scores(**s), **d)
 
@@ -319,7 +336,7 @@ def choose(
     chosen = ranked[0]
 
     reasoning = payload.get("reasoning", "")
-    return chosen, candidates, reasoning, strat
+    return chosen, ranked, reasoning, strat
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────
@@ -340,14 +357,13 @@ def main():
 
     goal = args[0]
     state = args[1] if len(args) > 1 else ""
-    chosen, candidates, reasoning, strat = choose(
+    chosen, ranked, reasoning, strat = choose(
         goal, state, strategy=strategy_override
     )
 
     print(f"=== Strategy: {strat.name} ===")
     print(f"    {strat.description}\n")
     print("=== Candidates ===\n")
-    ranked = strat.rank(candidates)
     for i, c in enumerate(ranked):
         marker = " ← CHOSEN" if c is chosen else ""
         print(f"  [{i}] {c.verb} → {c.artifact}{marker}")

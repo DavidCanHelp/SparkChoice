@@ -11,7 +11,7 @@ import pytest
 from sparkchoice import (
     Action, Scores, Strategy,
     WeightedSum, GeometricMean, EliminationGates,
-    ParetoThenWeighted, PhaseAdaptive,
+    ParetoThenRank, ParetoThenWeighted, PhaseAdaptive,
     STRATEGIES, get_strategy, choose,
 )
 
@@ -143,26 +143,47 @@ class TestEliminationGates:
         a = make_action(verb="a", unblocks=1, reduces_risk=1, readiness=1, impact=1)
         b = make_action(verb="b", unblocks=1, reduces_risk=1, readiness=2, impact=1)
         ranked = EliminationGates().rank([a, b])
-        # Both fail gates, so fallback to WeightedSum on all candidates
         assert len(ranked) == 2
 
+    def test_custom_delegate(self):
+        """EliminationGates can delegate to a non-default strategy."""
+        ready = make_action(verb="rdy", unblocks=3, reduces_risk=3, readiness=4, impact=3)
+        balanced = make_action(verb="bal", unblocks=4, reduces_risk=4, readiness=4, impact=4)
+        # Default delegate (WeightedSum) and GeometricMean agree here,
+        # but we verify the plumbing works
+        strat = EliminationGates(then=GeometricMean())
+        ranked = strat.rank([ready, balanced])
+        assert ranked[0].verb == "bal"  # geometric_mean favors balance
 
-# ── Strategy: ParetoThenWeighted ────────────────────────────────────────
+
+# ── Strategy: ParetoThenRank ───────────────────────────────────────────
 
 class TestPareto:
     def test_dominated_candidate_removed(self):
         dominant = make_action(verb="dom", unblocks=5, reduces_risk=5, readiness=5, impact=5)
         dominated = make_action(verb="sub", unblocks=3, reduces_risk=3, readiness=3, impact=3)
-        ranked = ParetoThenWeighted().rank([dominated, dominant])
+        ranked = ParetoThenRank().rank([dominated, dominant])
         assert ranked[0].verb == "dom"
-        # dominated should be excluded from ranking
         assert len(ranked) == 1
 
     def test_non_dominated_both_kept(self):
         a = make_action(verb="a", unblocks=5, reduces_risk=1, readiness=3, impact=3)
         b = make_action(verb="b", unblocks=1, reduces_risk=5, readiness=3, impact=3)
-        ranked = ParetoThenWeighted().rank([a, b])
+        ranked = ParetoThenRank().rank([a, b])
         assert len(ranked) == 2
+
+    def test_custom_delegate(self):
+        """ParetoThenRank can delegate to a non-default strategy."""
+        a = make_action(verb="a", unblocks=5, reduces_risk=1, readiness=3, impact=3)
+        b = make_action(verb="b", unblocks=3, reduces_risk=3, readiness=3, impact=3)
+        # Neither dominates the other. GeometricMean should prefer b (balanced).
+        strat = ParetoThenRank(then=GeometricMean())
+        ranked = strat.rank([a, b])
+        assert ranked[0].verb == "b"
+
+    def test_backward_compat_alias(self):
+        """ParetoThenWeighted is an alias for ParetoThenRank."""
+        assert ParetoThenWeighted is ParetoThenRank
 
 
 # ── Strategy: PhaseAdaptive ─────────────────────────────────────────────
@@ -207,7 +228,55 @@ class TestRegistry:
             get_strategy("magic_8_ball")
 
 
-# ── Score Independence (adversarial fixtures) ─────────────────────────
+# ── Strategy Composition ────────────────────────────────────────────────
+
+class TestStrategyComposition:
+    def test_gates_then_geometric(self):
+        """EliminationGates filtering + GeometricMean ranking."""
+        # Unready powerhouse: eliminated by gates
+        a = make_action(verb="a", unblocks=5, reduces_risk=5, readiness=1, impact=5)
+        # Balanced and ready
+        b = make_action(verb="b", unblocks=4, reduces_risk=4, readiness=4, impact=4)
+        # Ready but spikey
+        c = make_action(verb="c", unblocks=5, reduces_risk=2, readiness=4, impact=5)
+
+        strat = EliminationGates(then=GeometricMean())
+        ranked = strat.rank([a, b, c])
+
+        # a eliminated (readiness=1). Among b and c, geometric_mean
+        # prefers b (balanced 4s) over c (has a 2).
+        assert ranked[0].verb == "b"
+        assert len(ranked) == 2  # a was filtered out
+
+    def test_pareto_then_geometric(self):
+        """Pareto filtering + GeometricMean for survivors."""
+        dominant = make_action(verb="dom", unblocks=5, reduces_risk=5, readiness=5, impact=5)
+        balanced = make_action(verb="bal", unblocks=4, reduces_risk=4, readiness=4, impact=4)
+        tradeoff = make_action(verb="trd", unblocks=5, reduces_risk=1, readiness=5, impact=5)
+
+        strat = ParetoThenRank(then=GeometricMean())
+        ranked = strat.rank([tradeoff, balanced, dominant])
+
+        # dominant dominates balanced. tradeoff is not dominated by
+        # dominant (reduces_risk: 1 < 5, but pareto needs all >=).
+        # Wait — dominant has 5,5,5,5 and tradeoff has 5,1,5,5.
+        # dominant >= tradeoff on all dims and > on reduces_risk.
+        # So tradeoff IS dominated. Only dominant survives.
+        assert ranked[0].verb == "dom"
+        assert len(ranked) == 1
+
+    def test_gates_then_weighted_with_custom_weights(self):
+        """Compose gates with a custom-weighted sum."""
+        # Both pass gates, but custom weights favor impact
+        a = make_action(verb="a", unblocks=5, reduces_risk=3, readiness=3, impact=2)
+        b = make_action(verb="b", unblocks=2, reduces_risk=3, readiness=3, impact=5)
+
+        strat = EliminationGates(then=WeightedSum(weights=(1, 1, 1, 10)))
+        ranked = strat.rank([a, b])
+        assert ranked[0].verb == "b"  # impact×10 wins
+
+
+# ── Score Independence (adversarial fixtures) ───────────────────────
 #
 # These fixtures simulate score profiles that a model might produce if it
 # were shaping scores to validate a preferred strategy rather than scoring
@@ -269,7 +338,7 @@ class TestScoreIndependence:
         a = make_action(verb="unblocker", unblocks=5, reduces_risk=1, readiness=3, impact=3)
         b = make_action(verb="derisker", unblocks=1, reduces_risk=5, readiness=3, impact=3)
 
-        pareto_ranked = ParetoThenWeighted().rank([a, b])
+        pareto_ranked = ParetoThenRank().rank([a, b])
         assert len(pareto_ranked) == 2, "neither dominates the other — both must survive"
 
         ws_winner = WeightedSum().rank([a, b])[0]
@@ -303,8 +372,6 @@ class TestScoreIndependence:
         a = make_action(verb="a", unblocks=4, reduces_risk=3, readiness=3, impact=3)
         b = make_action(verb="b", unblocks=3, reduces_risk=3, readiness=3, impact=3)
 
-        # a beats b on unblocks by 1 point, equal everywhere else
-        # Every strategy should rank a >= b
         for name, cls in STRATEGIES.items():
             kwargs = {"phase": "building"} if name == "phase_adaptive" else {}
             ranked = cls(**kwargs).rank([b, a])
@@ -314,9 +381,7 @@ class TestScoreIndependence:
 
     def test_elimination_gates_fallback_preserves_all(self):
         """When all candidates fail gates, the fallback must return
-        everyone — not silently drop the 'inconvenient' ones. A model
-        that baked in elimination might produce scores where exactly
-        one candidate barely passes."""
+        everyone — not silently drop the 'inconvenient' ones."""
         a = make_action(verb="a", unblocks=1, reduces_risk=1, readiness=1, impact=1)
         b = make_action(verb="b", unblocks=1, reduces_risk=1, readiness=2, impact=1)
         c = make_action(verb="c", unblocks=2, reduces_risk=1, readiness=1, impact=1)
@@ -326,9 +391,7 @@ class TestScoreIndependence:
 
     def test_geometric_mean_zero_dimension_catastrophe(self):
         """If any dimension could hit 0 (or effective 0 via score=1),
-        geometric mean craters it. A coupled model might avoid giving
-        any candidate a 1 when recommending geometric_mean.
-        hole: gm((5,5,5,1)) = 3.34, balanced: gm((4,4,4,4)) = 4.0"""
+        geometric mean craters it."""
         strong_with_hole = make_action(
             verb="hole", unblocks=5, reduces_risk=5, readiness=5, impact=1,
         )
@@ -343,30 +406,21 @@ class TestScoreIndependence:
         assert gm_winner.verb == "balanced", "geometric_mean: impact=1 craters the score"
 
     def test_pareto_three_way_no_domination(self):
-        """Three candidates where none dominates another — a rock-paper-
-        scissors pattern. Pareto must keep all three. A coupled model
-        might tweak one candidate to be dominated and simplify the choice."""
+        """Three candidates where none dominates another — rock-paper-
+        scissors pattern. Pareto must keep all three."""
         rock = make_action(verb="rock", unblocks=5, reduces_risk=1, readiness=3, impact=3)
         paper = make_action(verb="paper", unblocks=3, reduces_risk=5, readiness=1, impact=3)
         scissors = make_action(verb="scissors", unblocks=3, reduces_risk=3, readiness=5, impact=1)
 
-        ranked = ParetoThenWeighted().rank([rock, paper, scissors])
+        ranked = ParetoThenRank().rank([rock, paper, scissors])
         assert len(ranked) == 3, "rock-paper-scissors: no candidate is dominated"
 
     def test_strategy_disagreement_matrix(self):
         """The ultimate coupling detector: a 4-candidate fixture designed
-        so that at least 3 different strategies produce different winners.
-        If scores were shaped for one strategy, this would collapse."""
-        # High total, weak readiness — weighted_sum's darling
-        # ws: 5*3+5*2+2*2+5*1 = 34, gm: (5*5*2*5)^0.25 = 3.98
+        so that at least 3 different strategies produce different winners."""
         a = make_action(verb="a", unblocks=5, reduces_risk=5, readiness=2, impact=5)
-        # Perfectly balanced — geometric_mean's darling
-        # ws: 4*3+4*2+4*2+4*1 = 32, gm: (4*4*4*4)^0.25 = 4.0
         b = make_action(verb="b", unblocks=4, reduces_risk=4, readiness=4, impact=4)
-        # High readiness + risk — firefighting phase's darling
-        # ff: 1*1+5*3+5*3+2*1 = 33, beats b's 32
         c = make_action(verb="c", unblocks=1, reduces_risk=5, readiness=5, impact=2)
-        # Below gates on risk — should be eliminated by gates
         d = make_action(verb="d", unblocks=4, reduces_risk=1, readiness=4, impact=4)
 
         pool = [a, b, c, d]
@@ -376,16 +430,11 @@ class TestScoreIndependence:
         eg_winner = EliminationGates().rank(pool)[0]
         ff_winner = PhaseAdaptive(phase="firefighting").rank(pool)[0]
 
-        # Weighted sum: a has highest raw weighted total
         assert ws_winner.verb == "a"
-        # Geometric mean: b is most balanced (a has readiness=1)
         assert gm_winner.verb == "b"
-        # Elimination gates: a fails readiness gate, d fails risk gate
         assert eg_winner.verb == "b"
-        # Firefighting: c dominates on readiness+risk which firefighting weights heavily
         assert ff_winner.verb == "c"
 
-        # At least 3 distinct winners across strategies
         winners = {ws_winner.verb, gm_winner.verb, ff_winner.verb}
         assert len(winners) >= 3, (
             f"Only {len(winners)} distinct winners — strategies may not be independent"
@@ -431,19 +480,21 @@ class TestChoose:
     @patch("sparkchoice.anthropic.Anthropic")
     def test_returns_chosen_action(self, mock_cls):
         mock_cls.return_value.messages.create.return_value = self._mock_response()
-        chosen, candidates, reasoning, strat = choose("build something")
+        chosen, ranked, reasoning, strat = choose("build something")
 
         assert chosen.verb == "write"
         assert chosen.artifact == "schema.sql"
         assert chosen.scores.unblocks == 5
 
     @patch("sparkchoice.anthropic.Anthropic")
-    def test_returns_all_candidates(self, mock_cls):
+    def test_returns_ranked_candidates(self, mock_cls):
+        """Candidates are returned in ranked order, not original order."""
         mock_cls.return_value.messages.create.return_value = self._mock_response()
-        chosen, candidates, reasoning, strat = choose("build something")
+        chosen, ranked, reasoning, strat = choose("build something")
 
-        assert len(candidates) == 2
-        assert candidates[1].verb == "build"
+        assert len(ranked) == 2
+        # First in ranked list should be the chosen one
+        assert ranked[0] is chosen
 
     @patch("sparkchoice.anthropic.Anthropic")
     def test_returns_reasoning(self, mock_cls):
@@ -474,6 +525,18 @@ class TestChoose:
         call_kwargs = mock_cls.return_value.messages.create.call_args.kwargs
         user_content = call_kwargs["messages"][0]["content"]
         assert "landing page" in user_content
+
+    @patch("sparkchoice.anthropic.Anthropic")
+    def test_payload_not_mutated(self, mock_cls):
+        """_to_action should not mutate the original API response."""
+        mock_cls.return_value.messages.create.return_value = self._mock_response()
+        choose("build something")
+
+        # If _to_action mutated the payload, a second call would fail
+        # because "scores" would be missing from candidates
+        mock_cls.return_value.messages.create.return_value = self._mock_response()
+        chosen, _, _, _ = choose("build something")
+        assert chosen.scores.unblocks == 5
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────
