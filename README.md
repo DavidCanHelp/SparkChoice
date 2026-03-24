@@ -79,6 +79,17 @@ ranked = GeometricMean().rank(candidates)
 pytest test_sparkchoice.py
 ```
 
+### Judgment Integrity
+
+SparkChoice includes adversarial test fixtures (`TestScoreIndependence`) designed to detect unwanted coupling between scoring and strategy selection. The risk: a model that recommends a strategy might also shape candidate scores to validate that recommendation, collapsing meaningful disagreement between strategies.
+
+The tests verify that strategy disagreement is preserved in edge cases rather than erased by score shaping. Representative cases:
+
+- **Spike vs balanced** — weighted_sum and geometric_mean must pick different winners; if they agree, scores may have been smoothed to erase the tradeoff
+- **Phase flip** — identical scores produce different winners under different project phases, proving the strategy is applied after scoring
+- **Geometric mean catastrophe** — a single weak dimension craters geometric_mean but not weighted_sum; a coupled model would avoid assigning low scores
+- **Disagreement matrix** — four candidates where at least three strategies each pick a different winner; the strongest test that strategies operate independently over honest scores
+
 ## License
 
 [MIT](LICENSE) — David Liedle <david.liedle@protonmail.com>

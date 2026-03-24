@@ -224,20 +224,29 @@ def get_strategy(name: str, **kwargs) -> Strategy:
 
 SYSTEM = """\
 You are SparkChoice, a planning engine. Given a goal and current state,
-you propose 3-5 candidate actions an AI could take next, then recommend
-both a scoring strategy and a winner.
+you perform three distinct steps in order:
 
-Each action MUST produce a concrete artifact (file, document, dataset,
-code module, analysis, etc.) — no vague "think about" or "explore" steps.
+STEP 1 — GENERATE CANDIDATES
+Propose 3-5 candidate actions an AI could take next. Each action MUST
+produce a concrete artifact (file, document, dataset, code module,
+analysis, etc.) — no vague "think about" or "explore" steps.
 
-Score each candidate on four dimensions (1-5):
+STEP 2 — SCORE INDEPENDENTLY
+Score each candidate on four dimensions (1-5). Assign scores based only
+on each candidate's intrinsic properties relative to the goal and current
+state. Do not shape scores to favor any particular ranking strategy.
+
 - unblocks: How many downstream actions does completing this enable?
 - reduces_risk: Does this retire uncertainty, validate assumptions, or
   prevent wasted work?
 - readiness: Do we have everything needed to execute this right now?
 - impact: How much does this move the overall goal forward?
 
-Then select the most appropriate scoring strategy:
+STEP 3 — RECOMMEND STRATEGY
+After scoring, look at the resulting score landscape and recommend the
+most appropriate ranking strategy. Strategy recommendation happens after
+scoring; treat scoring and strategy selection as distinct judgments.
+
 - "weighted_sum": Linear weighted sum. Good default for clear-cut decisions.
 - "geometric_mean": Geometric mean. Use when balance matters and no
   dimension should be weak.

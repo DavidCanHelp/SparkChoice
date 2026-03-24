@@ -18,7 +18,7 @@ from sparkchoice import (
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
-def make_action(verb="write", artifact="spec.md", **score_overrides):
+def make_action(verb="write", artifact="spec.md", inputs=None, **score_overrides):
     defaults = dict(unblocks=3, reduces_risk=3, readiness=3, impact=3)
     defaults.update(score_overrides)
     return Action(
@@ -27,7 +27,7 @@ def make_action(verb="write", artifact="spec.md", **score_overrides):
         description=f"{verb} the {artifact}.",
         rationale="Test action.",
         scores=Scores(**defaults),
-        inputs=[],
+        inputs=inputs or [],
         outputs=[artifact],
     )
 
@@ -205,6 +205,191 @@ class TestRegistry:
     def test_get_strategy_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown strategy"):
             get_strategy("magic_8_ball")
+
+
+# ── Score Independence (adversarial fixtures) ─────────────────────────
+#
+# These fixtures simulate score profiles that a model might produce if it
+# were shaping scores to validate a preferred strategy rather than scoring
+# independently. Each test runs ALL strategies over the SAME scores and
+# checks that the strategies genuinely disagree where they should — proving
+# the ranking is downstream of the scores, not baked into them.
+
+
+class TestScoreIndependence:
+    """Adversarial cases where score-strategy coupling is most likely to
+    break down. If scores were manufactured to favor a strategy, these
+    fixtures would expose it by showing that alternative strategies
+    produce different — and defensible — rankings."""
+
+    def test_uniform_scores_all_strategies_agree(self):
+        """When all candidates score identically, every strategy should
+        return the same set (order may vary but no candidate is preferred).
+        A coupled model might inflate one candidate to create a 'winner'."""
+        a = make_action(verb="a", unblocks=3, reduces_risk=3, readiness=3, impact=3)
+        b = make_action(verb="b", unblocks=3, reduces_risk=3, readiness=3, impact=3)
+        c = make_action(verb="c", unblocks=3, reduces_risk=3, readiness=3, impact=3)
+        pool = [a, b, c]
+
+        for name, cls in STRATEGIES.items():
+            kwargs = {"phase": "building"} if name == "phase_adaptive" else {}
+            ranked = cls(**kwargs).rank(pool)
+            assert len(ranked) == 3, f"{name} dropped a candidate on uniform scores"
+
+    def test_spike_vs_balanced_strategies_disagree(self):
+        """A high-spike candidate should win weighted_sum but lose to a
+        balanced candidate under geometric_mean. If scores were shaped to
+        make one strategy 'right', this disagreement would vanish."""
+        spike = make_action(verb="spike", unblocks=5, reduces_risk=5, readiness=1, impact=5)
+        balanced = make_action(verb="balanced", unblocks=4, reduces_risk=4, readiness=4, impact=4)
+
+        ws_winner = WeightedSum().rank([spike, balanced])[0]
+        gm_winner = GeometricMean().rank([spike, balanced])[0]
+
+        assert ws_winner.verb == "spike", "weighted_sum should favor raw total"
+        assert gm_winner.verb == "balanced", "geometric_mean should punish readiness=1"
+
+    def test_unready_high_scorer_gates_vs_weighted(self):
+        """A candidate that dominates on 3 of 4 dimensions but has
+        readiness=1 should win weighted_sum but be eliminated by gates.
+        Coupling would tempt the model to bump readiness to 3."""
+        powerhouse = make_action(verb="power", unblocks=5, reduces_risk=5, readiness=1, impact=5)
+        modest = make_action(verb="modest", unblocks=3, reduces_risk=3, readiness=4, impact=3)
+
+        ws_winner = WeightedSum().rank([powerhouse, modest])[0]
+        eg_winner = EliminationGates().rank([powerhouse, modest])[0]
+
+        assert ws_winner.verb == "power", "weighted_sum ignores readiness threshold"
+        assert eg_winner.verb == "modest", "gates should eliminate readiness=1"
+
+    def test_pareto_preserves_tradeoff_weighted_sum_breaks_tie(self):
+        """Two non-dominated candidates with opposite strengths. Pareto
+        keeps both; weighted_sum must pick one. A coupled model might
+        suppress one dimension to create artificial domination."""
+        a = make_action(verb="unblocker", unblocks=5, reduces_risk=1, readiness=3, impact=3)
+        b = make_action(verb="derisker", unblocks=1, reduces_risk=5, readiness=3, impact=3)
+
+        pareto_ranked = ParetoThenWeighted().rank([a, b])
+        assert len(pareto_ranked) == 2, "neither dominates the other — both must survive"
+
+        ws_winner = WeightedSum().rank([a, b])[0]
+        assert ws_winner.verb == "unblocker", "default weights favor unblocks×3"
+
+    def test_phase_flip_same_scores_different_winners(self):
+        """Identical scores, but switching phase flips the winner. This
+        proves the strategy is applied after scoring — if scores were
+        baked for one phase, the other phase would pick wrong."""
+        ready_impactful = make_action(
+            verb="polish", unblocks=1, reduces_risk=2, readiness=5, impact=5,
+        )
+        risky_unblocker = make_action(
+            verb="explore", unblocks=5, reduces_risk=5, readiness=1, impact=1,
+        )
+
+        ff_winner = PhaseAdaptive(phase="firefighting").rank(
+            [ready_impactful, risky_unblocker]
+        )[0]
+        gf_winner = PhaseAdaptive(phase="greenfield").rank(
+            [ready_impactful, risky_unblocker]
+        )[0]
+
+        assert ff_winner.verb == "polish", "firefighting: readiness+risk dominate"
+        assert gf_winner.verb == "explore", "greenfield: risk reduction dominates"
+
+    def test_one_point_gap_all_strategies_sensitive(self):
+        """When candidates differ by just 1 point on a single dimension,
+        strategies should still produce consistent rankings — not random
+        ones. A coupled model might exaggerate gaps to create clarity."""
+        a = make_action(verb="a", unblocks=4, reduces_risk=3, readiness=3, impact=3)
+        b = make_action(verb="b", unblocks=3, reduces_risk=3, readiness=3, impact=3)
+
+        # a beats b on unblocks by 1 point, equal everywhere else
+        # Every strategy should rank a >= b
+        for name, cls in STRATEGIES.items():
+            kwargs = {"phase": "building"} if name == "phase_adaptive" else {}
+            ranked = cls(**kwargs).rank([b, a])
+            assert ranked[0].verb == "a", (
+                f"{name} failed: 1-point unblocks advantage should still win"
+            )
+
+    def test_elimination_gates_fallback_preserves_all(self):
+        """When all candidates fail gates, the fallback must return
+        everyone — not silently drop the 'inconvenient' ones. A model
+        that baked in elimination might produce scores where exactly
+        one candidate barely passes."""
+        a = make_action(verb="a", unblocks=1, reduces_risk=1, readiness=1, impact=1)
+        b = make_action(verb="b", unblocks=1, reduces_risk=1, readiness=2, impact=1)
+        c = make_action(verb="c", unblocks=2, reduces_risk=1, readiness=1, impact=1)
+
+        ranked = EliminationGates().rank([a, b, c])
+        assert len(ranked) == 3, "all fail gates, so all must be in fallback"
+
+    def test_geometric_mean_zero_dimension_catastrophe(self):
+        """If any dimension could hit 0 (or effective 0 via score=1),
+        geometric mean craters it. A coupled model might avoid giving
+        any candidate a 1 when recommending geometric_mean.
+        hole: gm((5,5,5,1)) = 3.34, balanced: gm((4,4,4,4)) = 4.0"""
+        strong_with_hole = make_action(
+            verb="hole", unblocks=5, reduces_risk=5, readiness=5, impact=1,
+        )
+        balanced = make_action(
+            verb="balanced", unblocks=4, reduces_risk=4, readiness=4, impact=4,
+        )
+
+        gm_winner = GeometricMean().rank([strong_with_hole, balanced])[0]
+        ws_winner = WeightedSum().rank([strong_with_hole, balanced])[0]
+
+        assert ws_winner.verb == "hole", "weighted_sum: high total wins"
+        assert gm_winner.verb == "balanced", "geometric_mean: impact=1 craters the score"
+
+    def test_pareto_three_way_no_domination(self):
+        """Three candidates where none dominates another — a rock-paper-
+        scissors pattern. Pareto must keep all three. A coupled model
+        might tweak one candidate to be dominated and simplify the choice."""
+        rock = make_action(verb="rock", unblocks=5, reduces_risk=1, readiness=3, impact=3)
+        paper = make_action(verb="paper", unblocks=3, reduces_risk=5, readiness=1, impact=3)
+        scissors = make_action(verb="scissors", unblocks=3, reduces_risk=3, readiness=5, impact=1)
+
+        ranked = ParetoThenWeighted().rank([rock, paper, scissors])
+        assert len(ranked) == 3, "rock-paper-scissors: no candidate is dominated"
+
+    def test_strategy_disagreement_matrix(self):
+        """The ultimate coupling detector: a 4-candidate fixture designed
+        so that at least 3 different strategies produce different winners.
+        If scores were shaped for one strategy, this would collapse."""
+        # High total, weak readiness — weighted_sum's darling
+        # ws: 5*3+5*2+2*2+5*1 = 34, gm: (5*5*2*5)^0.25 = 3.98
+        a = make_action(verb="a", unblocks=5, reduces_risk=5, readiness=2, impact=5)
+        # Perfectly balanced — geometric_mean's darling
+        # ws: 4*3+4*2+4*2+4*1 = 32, gm: (4*4*4*4)^0.25 = 4.0
+        b = make_action(verb="b", unblocks=4, reduces_risk=4, readiness=4, impact=4)
+        # High readiness + risk — firefighting phase's darling
+        # ff: 1*1+5*3+5*3+2*1 = 33, beats b's 32
+        c = make_action(verb="c", unblocks=1, reduces_risk=5, readiness=5, impact=2)
+        # Below gates on risk — should be eliminated by gates
+        d = make_action(verb="d", unblocks=4, reduces_risk=1, readiness=4, impact=4)
+
+        pool = [a, b, c, d]
+
+        ws_winner = WeightedSum().rank(pool)[0]
+        gm_winner = GeometricMean().rank(pool)[0]
+        eg_winner = EliminationGates().rank(pool)[0]
+        ff_winner = PhaseAdaptive(phase="firefighting").rank(pool)[0]
+
+        # Weighted sum: a has highest raw weighted total
+        assert ws_winner.verb == "a"
+        # Geometric mean: b is most balanced (a has readiness=1)
+        assert gm_winner.verb == "b"
+        # Elimination gates: a fails readiness gate, d fails risk gate
+        assert eg_winner.verb == "b"
+        # Firefighting: c dominates on readiness+risk which firefighting weights heavily
+        assert ff_winner.verb == "c"
+
+        # At least 3 distinct winners across strategies
+        winners = {ws_winner.verb, gm_winner.verb, ff_winner.verb}
+        assert len(winners) >= 3, (
+            f"Only {len(winners)} distinct winners — strategies may not be independent"
+        )
 
 
 # ── choose() with mocked API ───────────────────────────────────────────
