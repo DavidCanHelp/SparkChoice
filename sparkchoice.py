@@ -354,7 +354,7 @@ def append_decision_log(
 ) -> None:
     """Append a single JSONL entry to the decision log file."""
     entry = {
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         "goal": goal,
         "state": state,
         "model": model,
